@@ -1,0 +1,335 @@
+---
+title: "Churn Probability Predictions Project"
+author: "Dibakar Bhowal"
+date: "2024-11-30"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# Libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(naniar)
+library(randomForest)
+library(ROSE)
+library(MASS)
+library(caret)
+library(car)
+library(pROC)
+```
+
+
+```{r}
+# Training Data
+churn_data <- read.csv("/home/mukta/Downloads/Churn_Train.csv")
+str(churn_data)
+summary(churn_data)
+```
+
+
+```{r}
+# Handling Anomalies
+
+# Numeric columns with negative values
+numeric_vars <- sapply(churn_data, is.numeric)
+
+negative_counts <- colSums(churn_data[, numeric_vars] < 0, na.rm = TRUE)
+
+print(negative_counts)
+
+# Identify columns with negative values
+anomalous_columns <- names(churn_data[, numeric_vars])[negative_counts > 0]
+
+# Replace negative values with NA
+if (length(anomalous_columns) > 0) {
+  churn_data[, anomalous_columns] <- lapply(churn_data[, anomalous_columns], function(x) {
+    x[x < 0] <- NA
+    return(x)
+  })
+  message("Negative values replaced with NA.")
+} else {
+  message("No negative values found in numeric columns.")
+}
+```
+
+
+```{r}
+# Missing Values
+missing_counts <- colSums(is.na(churn_data))
+sum(duplicated(churn_data))
+print(missing_counts) 
+```
+
+
+```{r}
+# Replacing missing numeric values with the median of the column
+numeric_vars <- sapply(churn_data, is.numeric)
+churn_data[, numeric_vars] <- lapply(churn_data[, numeric_vars], function(x) {
+  replace_na(x, median(x, na.rm = TRUE))
+})
+
+# Replacing missing categorical values with the mode of the column
+categorical_vars <- sapply(churn_data, is.factor)
+
+mode_function <- function(x) {
+  uniq_vals <- unique(x[!is.na(x)])
+  uniq_vals[which.max(tabulate(match(x, uniq_vals)))]
+}
+
+churn_data[, categorical_vars] <- lapply(churn_data[, categorical_vars], function(x) {
+  replace_na(x, mode_function(x))
+})
+
+# Verifying missing values have been handled
+missing_counts_after <- colSums(is.na(churn_data))
+print(missing_counts_after)
+if(all(missing_counts_after == 0)) {
+  message("All missing values have been successfully imputed.")
+} else {
+  message("There are still missing values.")
+}
+```
+
+
+```{r}
+# Preprocess
+churn_data$international_plan <- as.factor(churn_data$international_plan)
+churn_data$voice_mail_plan <- as.factor(churn_data$voice_mail_plan)
+churn_data$churn <- factor(churn_data$churn, levels = c("no", "yes"))
+churn_data[, numeric_vars] <- scale(churn_data[, numeric_vars])
+str(churn_data)
+
+# Dropping the 'state' & 'area code' variable as it's not meaningful for prediction
+churn_data <- subset(churn_data, select = -c(state, area_code))
+
+# Class Imbalance
+set.seed(123)
+balanced_data <- ROSE(churn ~ ., data = churn_data, seed = 123)$data
+
+# Splitting Data into Training and Testing Sets
+set.seed(123)
+trainIndex <- createDataPartition(balanced_data$churn, p = 0.7, list = FALSE)
+training <- balanced_data[trainIndex, ]
+testing <- balanced_data[-trainIndex, ]
+```
+
+
+```{r}
+print(table(churn_data$churn))
+print(table(balanced_data$churn))
+```
+
+
+```{r}
+# Train Random Forrest Model
+
+# Control Parameter
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
+
+# Hyper-parameter Grid for Random Forest
+rf_grid <- expand.grid(
+  mtry = c(1, 2, 3, 4),  # Number of variables tried at each split
+  splitrule = "gini",    # Splitting rule 
+  min.node.size = c(1, 5, 10)  # Minimum number of data points in a terminal node
+)
+
+# Hyper-parameter Tuning for Random Forest using cross-validation
+rf_tune <- train(
+  churn ~ ., data = training,
+  method = "ranger",
+  trControl = control,
+  tuneGrid = rf_grid,
+  metric = "ROC",
+  importance = "permutation"
+)
+
+# Predict probabilities on test data
+rf_pred <- predict(rf_tune, newdata = testing, type = "prob")
+
+# Convert probabilities to binary outcomes
+rf_pred_class <- ifelse(rf_pred[, "yes"] > 0.5, "yes", "no")
+
+# Ensure rf_pred_class is a factor
+rf_pred_class <- factor(rf_pred_class, levels = levels(testing$churn))
+
+# Confusion matrix
+rf_cm <- confusionMatrix(rf_pred_class, testing$churn)
+
+# Print tuned model results
+print(rf_tune)
+print(rf_cm)
+```
+
+
+```{r}
+# Train Logistic Regression Model
+logit_model <- glm(churn ~ ., data = training, family = "binomial")
+
+# Multicollinearity test
+vif(logit_model)
+
+# Predict probabilities on test data
+logit_pred <- predict(logit_model, newdata = testing, type = "response")
+
+# Convert probabilities to binary outcomes
+logit_pred_class <- ifelse(logit_pred > 0.5, "yes", "no")
+
+# Ensure logit_pred_class is a factor
+logit_pred_class <- factor(logit_pred_class, levels = levels(testing$churn))
+
+# Confusion matrix
+logit_cm <- confusionMatrix(logit_pred_class, testing$churn)
+print(logit_model)
+print(logit_cm)
+```
+
+
+```{r}
+# ROC Curve and AUC for Logistic Regression
+roc_curve <- roc(testing$churn, logit_pred)
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2, legacy.axes = TRUE)
+grid()
+auc(roc_curve)
+```
+
+
+```{r}
+# Evaluate models' performance
+logit_accuracy <- logit_cm$overall['Accuracy']
+logit_auc <- roc(testing$churn, logit_pred)$auc
+
+rf_accuracy <- rf_cm$overall['Accuracy']
+rf_auc <- roc(testing$churn, predict(rf_tune, newdata = testing, type = "prob")[,2])$auc
+
+# Additional metrics for Logistic Regression
+logit_precision <- posPredValue(logit_pred_class, testing$churn, positive = "yes")
+logit_recall <- sensitivity(logit_pred_class, testing$churn, positive = "yes")
+logit_f1 <- (2 * logit_precision * logit_recall) / (logit_precision + logit_recall)
+
+
+# Additional metrics for Random Forest
+rf_precision <- precision(rf_pred_class, testing$churn, positive = "yes")
+rf_recall <- recall(rf_pred_class, testing$churn, positive = "yes")
+rf_f1 <- (2 * rf_precision * rf_recall) / (rf_precision + rf_recall)
+
+# Display comparison of models
+cat("Logistic Regression Accuracy:", logit_accuracy, "\n")
+cat("Random Forest Accuracy:", rf_accuracy, "\n")
+
+cat("Logistic Regression AUC:", logit_auc, "\n")
+cat("Random Forest AUC:", rf_auc, "\n")
+
+cat("Logistic Regression Precision:", logit_precision, "\n")
+cat("Random Forest Precision:", rf_precision, "\n")
+
+cat("Logistic Regression Recall:", logit_recall, "\n")
+cat("Random Forest Recall:", rf_recall, "\n")
+
+cat("Logistic Regression F1 Score:", logit_f1, "\n")
+cat("Random Forest F1 Score:", rf_f1, "\n")
+```
+
+
+```{r}
+# ROC Curve and AUC for Random Forest 
+roc_curve <- roc(testing$churn, rf_pred[,2])
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2, legacy.axes = TRUE)
+grid()
+auc(roc_curve)
+```
+
+
+```{r}
+# Combine Models
+# Obtain probabilities from Logistic Regression (on training data)
+logit_pred_prob <- predict(logit_model, newdata = testing, type = "response")
+
+# Obtain probabilities from Random Forest (on training data)
+rf_pred_prob <- predict(rf_tune, newdata = testing, type = "prob")[, 2] 
+
+# Model Correlation
+cor(logit_pred_prob, rf_pred_prob)
+
+# Combine the predicted probabilities into a new data frame
+stacked_data <- data.frame(Logit_Pred = logit_pred_prob, RF_Pred = rf_pred_prob)
+
+# Target variable (churn) from the training data
+stacked_data$Churn <- testing$churn
+
+# Train a meta-model using logistic regression
+meta_model <- glm(Churn ~ Logit_Pred + RF_Pred, data = stacked_data, family = "binomial")
+
+# Summarize the meta-model
+summary(meta_model)
+
+# Make predictions on the training data using the meta-model
+meta_pred_prob <- predict(meta_model, newdata = stacked_data, type = "response")
+
+# Convert probabilities to class labels (threshold of 0.5)
+meta_pred_class <- ifelse(meta_pred_prob > 0.5, "yes", "no")
+
+# Ensure the predictions are factors with the same levels as the training target
+meta_pred_class <- factor(meta_pred_class, levels = levels(testing$churn))
+
+# Confusion Matrix
+meta_cm <- confusionMatrix(meta_pred_class, testing$churn)
+print(meta_cm)
+
+# ROC Curve and AUC
+roc_curve <- roc(testing$churn, meta_pred_prob)
+plot(roc_curve, main = "ROC Curve for Meta-Model", col = "blue")
+cat("AUC for Meta-Model:", auc(roc_curve), "\n")
+```
+
+
+
+```{r}
+# Predict on New Data
+load("/home/mukta/Downloads/Customers_To_Predict.RData")
+
+# Ensure categorical columns are factors
+Customers_To_Predict$international_plan <- as.factor(Customers_To_Predict$international_plan)
+Customers_To_Predict$voice_mail_plan <- as.factor(Customers_To_Predict$voice_mail_plan)
+
+# Ensure 'numeric_vars' is recalculated for Customers_To_Predict
+numeric_vars <- sapply(Customers_To_Predict, is.numeric)
+
+# Subset only numeric columns
+Customers_To_Predict[, numeric_vars] <- scale(Customers_To_Predict[, numeric_vars])
+
+# Predict churn probabilities using Logistic Regression
+logit_prob <- predict(logit_model, newdata = Customers_To_Predict, type = "response")
+
+# Predict churn probabilities using Random Forest
+rf_prob <- predict(rf_tune, newdata = Customers_To_Predict, type = "prob")[, 2]  # 'yes' class probabilities
+
+# Combine probabilities into a new data frame for stacked model
+stacked_predictions <- data.frame(Logit_Pred = logit_prob, RF_Pred = rf_prob)
+
+# Predict churn probabilities using the stacked meta-model
+stacked_prob <- predict(meta_model, newdata = stacked_predictions, type = "response")
+
+# Add churn probabilities to the Customers_To_Predict data-set
+Customers_To_Predict$Logit_Prob <- logit_prob
+Customers_To_Predict$RF_Prob <- rf_prob
+Customers_To_Predict$Stacked_Prob <- stacked_prob
+
+# Churn prediction using threshold (0.5)
+Customers_To_Predict$Churn_Pred <- ifelse(rf_prob > 0.5, "yes", "no")
+
+# Ensure Churn_Pred is a factor
+Customers_To_Predict$Churn_Pred <- factor(Customers_To_Predict$Churn_Pred, levels = c("no", "yes"))
+
+# Save Results
+save(Customers_To_Predict, file = "Customers_With_Stacked_Predictions.RData")
+save.image("Dibakar.RData")
+```
+
