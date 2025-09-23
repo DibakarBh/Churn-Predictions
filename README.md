@@ -1,3 +1,5 @@
+# Results Breakdown
+
 In this project, both Logistic Regression (Logit) and Random Forest (RF) models were
 evaluated for their ability to predict customer churn. The evaluation metrics included
 accuracy, AUC (Area Under the ROC Curve), precision, recall, and overall interpretability.
